@@ -47,7 +47,7 @@ from typing import TypedDict, List, Dict, Optional
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, END
 
-from tools import web_search, SearchResult
+from tools import web_search, SearchResult, search_arxiv_structured
 
 MODEL_NAME = os.environ.get("RESEARCH_AGENT_MODEL", "llama-3.3-70b-versatile")
 # How many concurrent search calls to run at once during retrieval, and how
@@ -278,7 +278,7 @@ def extract_topic_entity(question: str) -> Optional[str]:
     retry loop), preventing topic drift across iterations.
     """
     # Prefer an explicitly quoted term first.
-    quoted = re.search(r"\"([^\"]{2,60})\"|'([^']{2,60})'", question)
+    quoted = re.search(r"\"([^\"]{2,250})\"|'([^']{2,250})'", question)
     if quoted:
         return (quoted.group(1) or quoted.group(2)).strip()
 
@@ -489,21 +489,33 @@ def retrieve_node(state: AgentState) -> AgentState:
     # concurrently below instead of one-at-a-time — with up to 25 calls in
     # broad paper mode, sequential execution was the main source of
     # slowness.
-    tasks = []  # list of (label, query_string, max_results)
+    #
+    # arxiv.org is special-cased to hit the real Arxiv API directly
+    # (search_arxiv_structured) rather than a DuckDuckGo `site:arxiv.org`
+    # search — DDG's coverage of arXiv depends on what it happens to have
+    # indexed, while the Arxiv API is authoritative and typically returns
+    # more/better matches for a given topic.
+    tasks = []  # list of (label, kind, query_string, max_results)
     if state["paper_mode"]:
         per_domain_results = 4 if mode == "broad" else 2
         for q in state["pending_queries"]:
             for domain in ACADEMIC_DOMAINS:
-                domain_query = f"site:{domain} {q}"
-                tasks.append((domain_query, domain_query, per_domain_results))
+                if domain == "arxiv.org":
+                    label = f"arxiv API: {q}"
+                    tasks.append((label, "arxiv", q, per_domain_results))
+                else:
+                    domain_query = f"site:{domain} {q}"
+                    tasks.append((domain_query, "web", domain_query, per_domain_results))
     else:
         for q in state["pending_queries"]:
-            tasks.append((q, q, 4))
+            tasks.append((q, "web", q, 4))
 
     print(f"\n[RETRIEVE] Running {len(tasks)} search(es) in parallel...")
 
-    def _run_task(label, query_string, max_results):
+    def _run_task(label, kind, query_string, max_results):
         try:
+            if kind == "arxiv":
+                return label, search_arxiv_structured(query_string, max_results=max_results), None
             return label, web_search(query_string, max_results=max_results), None
         except Exception as e:
             return label, [], e
@@ -513,8 +525,8 @@ def retrieve_node(state: AgentState) -> AgentState:
         max_workers = min(SEARCH_MAX_WORKERS, len(tasks))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(_run_task, label, q, n): label
-                for (label, q, n) in tasks
+                executor.submit(_run_task, label, kind, q, n): label
+                for (label, kind, q, n) in tasks
             }
             for future in as_completed(futures):
                 label = futures[future]
