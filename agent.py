@@ -44,6 +44,28 @@ gathered from *previous* runs. analyze_node writes newly gathered
 sources back into Chroma after synthesizing an answer, so the knowledge
 base grows over time and future queries can hit cached, relevant
 evidence instantly instead of only relying on live search.
+
+Claim-level verification
+-------------------------
+verify_node splits the draft answer into individual factual claims (each
+tied to its [n] citation) and checks each one against the specific
+source it cites, rather than passing/failing the answer as a whole. This
+gives a support_ratio (fraction of claims that hold up) instead of a
+single true/false, and finalize_node uses it to strip any claim that
+didn't hold up before the answer is scored by RAGAS.
+
+JSON robustness (verify + plan)
+--------------------------------
+Both plan_node and verify_node ask the LLM to return JSON. Three layers
+guard against malformed output instead of one brittle json.loads call:
+  1. `response_format: json_object` is set on the underlying Groq calls
+     for both models, which materially reduces malformed JSON.
+  2. `_extract_json` falls back to `json_repair` (if installed) when a
+     strict parse fails, fixing common issues like unescaped quotes or
+     a truncated trailing object.
+  3. verify_node retries the LLM call itself (cheap) up to once more on
+     a parse failure, instead of forcing the whole retrieve->analyze->
+     verify loop to re-run just to get another shot at valid JSON.
 """
 
 import os
@@ -51,6 +73,7 @@ import json
 import re
 import time
 from vector_store import query_chroma, add_to_chroma
+from evaluation import evaluate_answer
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import TypedDict, List, Dict, Optional
 
@@ -58,6 +81,18 @@ from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, END
 
 from tools import web_search, SearchResult, search_arxiv_structured
+
+try:
+    from flashrank import Ranker, RerankRequest
+    _FLASHRANK_AVAILABLE = True
+except ImportError:
+    _FLASHRANK_AVAILABLE = False
+
+try:
+    from json_repair import repair_json
+    _JSON_REPAIR_AVAILABLE = True
+except ImportError:
+    _JSON_REPAIR_AVAILABLE = False
 
 MODEL_NAME = os.environ.get("RESEARCH_AGENT_MODEL", "llama-3.3-70b-versatile")
 # How many concurrent search calls to run at once during retrieval, and how
@@ -74,13 +109,71 @@ PLANNING_MODEL_NAME = os.environ.get("RESEARCH_AGENT_PLANNING_MODEL", "llama-3.1
 FALLBACK_MODEL_NAME = os.environ.get("RESEARCH_AGENT_FALLBACK_MODEL", "llama-3.1-8b-instant")
 MAX_ITERATIONS = int(os.environ.get("RESEARCH_AGENT_MAX_ITERATIONS", "2"))
 LLM_MAX_RETRIES = int(os.environ.get("RESEARCH_AGENT_LLM_MAX_RETRIES", "3"))
+# How many times verify_node will retry ONLY the verification LLM call
+# (cheap) if the response fails to parse as JSON, before giving up and
+# treating the result as unparseable. This is intentionally separate
+# from LLM_MAX_RETRIES (which handles 429s) — this handles malformed
+# JSON on an otherwise-successful response.
+VERIFY_PARSE_RETRIES = int(os.environ.get("RESEARCH_AGENT_VERIFY_PARSE_RETRIES", "2"))
+# Cap on how many sources are actually shown to the LLM during synthesis
+# (analyze_node), independent of how many were retrieved. Retrieval can
+# gather 20-30+ candidates across web/arxiv/chroma, but handing all of
+# them to the LLM at once dilutes grounding — it starts blending claims
+# across weak, tangential sources instead of sticking to the strongest
+# ones, which directly hurts RAGAS faithfulness/relevancy. Only applied
+# outside paper mode; count/specific/broad paper modes already have their
+# own tighter pool caps in retrieve_node and need the full set to find
+# the right paper(s).
+MAX_SYNTHESIS_SOURCES = int(os.environ.get("RESEARCH_AGENT_MAX_SYNTHESIS_SOURCES", "8"))
+# Cross-encoder reranker model used to pick the MAX_SYNTHESIS_SOURCES best
+# sources out of the full retrieved pool, instead of a naive front-slice.
+# ms-marco-MiniLM-L-12-v2 is a small (~130MB) model that flashrank
+# downloads and caches locally on first use.
+RERANKER_MODEL_NAME = os.environ.get("RESEARCH_AGENT_RERANKER_MODEL", "ms-marco-MiniLM-L-12-v2")
+
+_reranker_instance = None
+
+
+def _get_reranker():
+    """Lazily construct the reranker once per process (loading the model
+    is the expensive part, not calling it) and reuse it across requests."""
+    global _reranker_instance
+    if _reranker_instance is None and _FLASHRANK_AVAILABLE:
+        _reranker_instance = Ranker(model_name=RERANKER_MODEL_NAME, cache_dir="/tmp/flashrank_cache")
+    return _reranker_instance
 # Never silently block longer than this on a single retry wait.
 MAX_SINGLE_WAIT_SECONDS = int(os.environ.get("RESEARCH_AGENT_MAX_WAIT_SECONDS", "90"))
 HEARTBEAT_INTERVAL_SECONDS = 15
 
+# Minimum fraction of claims that must be individually supported by their
+# cited source for the draft to be considered "verified". Below this, the
+# graph loops back to retrieval (if iterations remain) instead of
+# finalizing on weak evidence.
+MIN_SUPPORT_RATIO = float(os.environ.get("RESEARCH_AGENT_MIN_SUPPORT_RATIO", "0.8"))
+
+# response_format=json_object forces the model to emit syntactically
+# valid JSON (Groq/OpenAI-compatible constrained decoding), which is the
+# single biggest fix for the "Expecting ',' delimiter" parse failures
+# seen from plan_node/verify_node's free-text JSON requests. Both models
+# used for structured output get this; the strong synthesis model does
+# NOT get it since analyze_node's draft answer is prose, not JSON.
+_JSON_MODE_KWARGS = {"response_format": {"type": "json_object"}}
+
 llm = ChatGroq(model=MODEL_NAME, temperature=0, max_tokens=2000)
-planning_llm = ChatGroq(model=PLANNING_MODEL_NAME, temperature=0, max_tokens=800)
+planning_llm = ChatGroq(
+    model=PLANNING_MODEL_NAME, temperature=0, max_tokens=800,
+    model_kwargs=_JSON_MODE_KWARGS,
+)
 fallback_llm = ChatGroq(model=FALLBACK_MODEL_NAME, temperature=0, max_tokens=2000)
+# Claim-level verification asks for a JSON array with one entry per
+# sentence in the draft — for a typical 8-12 sentence answer this can
+# easily exceed planning_llm's 800-token cap and get truncated mid-JSON,
+# which silently fails to parse and produces a false "0 claims" result.
+# Give this call its own larger budget instead of reusing planning_llm.
+verification_llm = ChatGroq(
+    model=PLANNING_MODEL_NAME, temperature=0, max_tokens=1800,
+    model_kwargs=_JSON_MODE_KWARGS,
+)
 
 
 def _is_daily_quota_error(error_message: str) -> bool:
@@ -154,6 +247,7 @@ def _parse_retry_after(error_message: str) -> Optional[float]:
     seconds = float(m.group(2))
     return minutes * 60 + seconds + 1  # +1s buffer
 
+
 ACADEMIC_DOMAINS = [
     "arxiv.org",
     "semanticscholar.org",
@@ -196,6 +290,9 @@ class AgentState(TypedDict):
     paper_count: Optional[int]           # target count (broad -> BROAD_MODE_TARGET)
     paper_title: Optional[str]           # set only in "specific" mode
     topic_entity: Optional[str]          # locked topic, re-injected into every query
+    eval_scores: Dict[str, float]        # RAGAS quality scores, set in finalize_node
+    support_ratio: Optional[float]       # fraction of claims individually supported; None if unparseable
+    unsupported_claims: List[Dict]       # claims that failed claim-level verification
 
 
 # ---------------------------------------------------------------------------
@@ -203,23 +300,84 @@ class AgentState(TypedDict):
 # ---------------------------------------------------------------------------
 
 def _extract_json(text: str):
-    """LLMs sometimes wrap JSON in ```json fences or add preamble. Strip it."""
+    """
+    LLMs sometimes wrap JSON in ```json fences or add preamble. Strip it,
+    then parse. If a strict parse fails (e.g. an unescaped quote inside a
+    claim string, or a response truncated mid-object), fall back to
+    json_repair if it's installed rather than raising immediately — this
+    recovers the common near-miss cases without needing another LLM call.
+    """
     text = text.strip()
     text = re.sub(r"^```(json)?", "", text).strip()
     text = re.sub(r"```$", "", text).strip()
     match = re.search(r"[\{\[].*[\}\]]", text, re.DOTALL)
     if match:
         text = match.group(0)
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        if _JSON_REPAIR_AVAILABLE:
+            repaired = repair_json(text)
+            return json.loads(repaired)
+        raise
 
 
-def _format_sources_block(sources: List[SearchResult]) -> str:
+def _format_sources_block(sources: List[SearchResult], include_indices: Optional[List[int]] = None) -> str:
+    """
+    Renders sources as a numbered block for prompts. Numbers are always
+    the source's position in the FULL `sources` list (1-indexed), even
+    when only a subset is shown via `include_indices` — this keeps [n]
+    citations in the draft answer pointing at the correct entry in
+    `state["sources"]` later in finalize_node, regardless of how many
+    sources were actually shown to the LLM at synthesis time.
+    """
     if not sources:
         return "(no sources gathered yet)"
+    indices = include_indices if include_indices is not None else list(range(len(sources)))
+    if not indices:
+        return "(no sources gathered yet)"
     return "\n".join(
-        f"[{i+1}] {s.title}\n    URL: {s.url}\n    Snippet: {s.snippet}"
-        for i, s in enumerate(sources)
+        f"[{i+1}] {sources[i].title}\n    URL: {sources[i].url}\n    Snippet: {sources[i].snippet}"
+        for i in indices
     )
+
+
+def _naive_top_indices(sources: List[SearchResult], cap: int) -> List[int]:
+    """Fallback front-slice, used only if the reranker is unavailable or errors."""
+    return list(range(min(cap, len(sources))))
+
+
+def _top_synthesis_indices(sources: List[SearchResult], cap: int, query: str = "") -> List[int]:
+    """
+    Selects which sources (by index into the full list) get shown to the
+    LLM during synthesis, when the pool is larger than `cap`. Uses a
+    flashrank cross-encoder reranker to score each source's relevance to
+    the actual question, rather than relying on retrieval order — search
+    APIs don't always return their best result first, and this is what
+    actually determines which sources reach the LLM at all. Falls back to
+    a naive front-slice if flashrank isn't installed or the rerank call
+    fails for any reason, so this can never break the pipeline.
+    """
+    if len(sources) <= cap:
+        return list(range(len(sources)))
+
+    ranker = _get_reranker()
+    if ranker is None or not query:
+        return _naive_top_indices(sources, cap)
+
+    try:
+        passages = [
+            {"id": i, "text": f"{s.title}. {s.snippet}"}
+            for i, s in enumerate(sources)
+        ]
+        reranked = ranker.rerank(RerankRequest(query=query, passages=passages))
+        # flashrank returns passages sorted best-first, each carrying back
+        # the original "id" we passed in (our index into `sources`).
+        ranked_indices = [r["id"] for r in reranked][:cap]
+        return ranked_indices
+    except Exception as e:
+        print(f"  [rerank] warning: reranking failed, falling back to retrieval order: {e}")
+        return _naive_top_indices(sources, cap)
 
 
 def _normalize_title(title: str) -> str:
@@ -394,6 +552,9 @@ def _init_state(question: str) -> AgentState:
         "paper_count": paper_count,
         "paper_title": paper_title,
         "topic_entity": topic_entity,
+        "eval_scores": {},
+        "support_ratio": 0.0,
+        "unsupported_claims": [],
     }
 
 
@@ -456,12 +617,16 @@ query must say "LangChain", not an alternate spelling).
 {topic_lock_instruction}
 {paper_instruction}
 
-Respond with ONLY a JSON array of strings, nothing else.
-Example: ["query one", "query two", "query three"]"""
+Respond with ONLY a JSON object of this exact shape, nothing else:
+{{"queries": ["query one", "query two", "query three"]}}"""
 
     response = _invoke_with_retry(planning_llm, prompt)
     try:
-        queries = _extract_json(response.content)
+        parsed = _extract_json(response.content)
+        # response_format=json_object requires the top-level response to be
+        # a JSON *object*, not a bare array — so the prompt now asks for
+        # {"queries": [...]} rather than a raw array like before.
+        queries = parsed["queries"] if isinstance(parsed, dict) else parsed
         assert isinstance(queries, list) and all(isinstance(q, str) for q in queries)
     except Exception:
         queries = [state["query"]]
@@ -591,9 +756,16 @@ def retrieve_node(state: AgentState) -> AgentState:
 
 def analyze_node(state: AgentState) -> AgentState:
     print("\n[ANALYZE] Synthesizing evidence into a draft answer...")
-    sources_block = _format_sources_block(state["sources"])
 
     mode = state["paper_query_mode"]
+    if not state["paper_mode"] and len(state["sources"]) > MAX_SYNTHESIS_SOURCES:
+        synthesis_indices = _top_synthesis_indices(state["sources"], MAX_SYNTHESIS_SOURCES, query=state["query"])
+        print(f"  Capping synthesis context: {len(state['sources'])} retrieved -> "
+              f"top {len(synthesis_indices)} shown to LLM (reranked).")
+    else:
+        synthesis_indices = None  # show all sources (paper modes need the full pool)
+
+    sources_block = _format_sources_block(state["sources"], include_indices=synthesis_indices)
     paper_instruction = ""
     if mode == "specific":
         paper_instruction = f"""
@@ -633,6 +805,11 @@ If the evidence doesn't fully support a claim, don't state it as fact.
 Do NOT add your own "References" or "Sources" section at the end — only
 use inline [n] citations within the text. A reference list will be
 generated automatically afterward.
+
+Do NOT add a closing summary or evaluative sentence (e.g. "this
+technology has the potential to revolutionize...") unless that exact
+judgment is directly stated in a cited source. End the answer on the
+last substantive, source-backed point.
 {paper_instruction}
 
 Question: {state['query']}
@@ -659,7 +836,22 @@ references list):"""
 
 
 def verify_node(state: AgentState) -> AgentState:
-    print("\n[VERIFY] Checking draft against evidence...")
+    """
+    Claim-level verification. Rather than asking the LLM to pass/fail the
+    draft as a whole (which tends to rubber-stamp "verified: true" even
+    when RAGAS later finds low faithfulness), this splits the draft into
+    individual claims and checks each one against the specific source it
+    cites. `support_ratio` (fraction of claims that hold up) drives the
+    retry decision, and unsupported claims are passed through to
+    finalize_node so they can be stripped before the answer is scored.
+
+    On a JSON parse failure, this retries ONLY the verification LLM call
+    itself (cheap) up to VERIFY_PARSE_RETRIES times before giving up —
+    NOT the full retrieve->analyze->verify loop, which would re-run
+    retrieval and re-generate the entire draft just for another shot at
+    valid JSON, and was the main cause of cascading Groq 429s.
+    """
+    print("\n[VERIFY] Checking draft against evidence (claim-level)...")
     sources_block = _format_sources_block(state["sources"])
 
     topic_lock_instruction = ""
@@ -670,9 +862,16 @@ def verify_node(state: AgentState) -> AgentState:
             f"verbatim — do not drift onto a related but different topic."
         )
 
-    prompt = f"""You are a fact-checking reviewer. Compare the DRAFT ANSWER
-against the EVIDENCE and check whether every factual claim is actually
-supported by at least one numbered source.
+    prompt = f"""You are a fact-checking reviewer. Break the DRAFT ANSWER into
+individual factual claims (roughly one per sentence). For EACH claim,
+check whether it is directly supported by the specific numbered source(s)
+it cites in the evidence below. A claim is only "supported" if the cited
+source's snippet actually contains that information — not just related
+information, and not general topic knowledge.
+
+When writing each "claim" value, paraphrase it in plain prose and avoid
+using quotation marks or apostrophes inside the string — this output
+must be valid JSON.
 
 Question: {state['query']}
 
@@ -685,43 +884,111 @@ Draft answer:
 
 Respond with ONLY JSON in this exact shape:
 {{
-  "verified": true or false,
-  "notes": "short explanation of any unsupported claims or gaps",
-  "additional_search_queries": ["query if more evidence is needed", ...]
+  "claims": [
+    {{"claim": "short paraphrase of the claim", "citation": 14, "supported": true or false}},
+    ...
+  ],
+  "additional_search_queries": ["query if unsupported claims need better evidence", ...]
 }}
-If everything is well supported, set "verified": true and
-"additional_search_queries": []."""
+Include every claim that has at least one [n] citation in the draft.
+If a claim has no citation, mark "citation": null and "supported": false."""
 
-    response = _invoke_with_retry(planning_llm, prompt)
-    try:
-        result = _extract_json(response.content)
-        verified = bool(result.get("verified", False))
-        notes = result.get("notes", "")
+    result = None
+    parse_failed = False
+    response = None
+    for parse_attempt in range(VERIFY_PARSE_RETRIES + 1):
+        response = _invoke_with_retry(verification_llm, prompt, fallback=fallback_llm)
+        try:
+            result = _extract_json(response.content)
+            parse_failed = False
+            break
+        except Exception as e:
+            parse_failed = True
+            print(f"  [verify] parse attempt {parse_attempt + 1}/{VERIFY_PARSE_RETRIES + 1} "
+                  f"failed to parse verifier JSON: {e}")
+
+    if parse_failed:
+        print(f"  [verify] raw response (first 500 chars): {response.content[:500]}")
+        claims, gap_queries = [], []
+    else:
+        claims = result.get("claims", []) or []
         gap_queries = result.get("additional_search_queries", []) or []
-    except Exception:
-        verified, notes, gap_queries = True, "Could not parse verifier output; proceeding.", []
+
+    if parse_failed:
+        # We genuinely don't know whether claims are supported — this is
+        # a parsing failure, not a real 0% score. Route back to retrieval
+        # (if iterations remain) but don't claim a specific support ratio.
+        support_ratio = None
+        verified = False
+        unsupported = []
+        notes = "Verifier response could not be parsed as JSON after retries; re-checking."
+    elif claims:
+        supported_count = sum(1 for c in claims if c.get("supported"))
+        support_ratio = supported_count / len(claims)
+        verified = support_ratio >= MIN_SUPPORT_RATIO
+        unsupported = [c for c in claims if not c.get("supported")]
+        notes = (
+            f"{len(unsupported)}/{len(claims)} claim(s) unsupported: "
+            + "; ".join(c.get("claim", "") for c in unsupported[:5])
+            if unsupported else "All claims supported."
+        )
+    else:
+        # Valid JSON, but the model genuinely found zero citable claims
+        # (e.g. an empty or citation-free draft). Distinct from a parse
+        # failure, and distinct from "all claims supported".
+        support_ratio = 0.0
+        verified = False
+        unsupported = []
+        notes = "No citable claims were found in the draft."
 
     # Belt-and-suspenders topic lock: even if the verifier LLM forgot the
     # instruction, force the locked topic into every follow-up query so
     # the retry loop can't drift onto a different subject.
     gap_queries = [_lock_topic(q, state["topic_entity"]) for q in gap_queries]
 
-    print(f"  Verified: {verified}")
-    if notes:
-        print(f"  Notes: {notes}")
+    print(f"  Support ratio: {support_ratio:.2f}" if support_ratio is not None else "  Support ratio: unknown (parse failure)")
+    if unsupported:
+        print(f"  Unsupported: {[c.get('claim','') for c in unsupported]}")
 
     return {
         **state,
         "verified": verified,
         "verification_notes": notes,
         "pending_queries": gap_queries,
+        "support_ratio": support_ratio,
+        "unsupported_claims": unsupported,
     }
 
 
 def finalize_node(state: AgentState) -> AgentState:
     print("\n[FINALIZE] Assembling final answer with references...")
 
-    cited_numbers = sorted({int(n) for n in re.findall(r"\[(\d+)\]", state["draft_answer"])})
+    draft = state["draft_answer"]
+
+    # Strip any claim that failed claim-level verification before the
+    # answer is scored by RAGAS, so unsupported statements never reach
+    # the final output. Wrapped defensively — if this call fails for any
+    # reason, fall back to the original draft rather than blocking.
+    if state.get("unsupported_claims"):
+        print(f"  Stripping {len(state['unsupported_claims'])} unsupported claim(s) before finalizing...")
+        strip_prompt = f"""Remove ONLY the following unsupported claims from this
+answer. Do not rewrite, rephrase, or reorder anything else. Keep all
+other sentences and their [n] citations exactly as-is.
+
+Claims to remove:
+{chr(10).join('- ' + c.get('claim', '') for c in state['unsupported_claims'])}
+
+Original answer:
+{draft}
+
+Return only the edited answer, no preamble."""
+        try:
+            response = _invoke_with_retry(llm, strip_prompt, fallback=fallback_llm)
+            draft = response.content
+        except Exception as e:
+            print(f"  [strip] warning: failed to strip unsupported claims, using original draft: {e}")
+
+    cited_numbers = sorted({int(n) for n in re.findall(r"\[(\d+)\]", draft)})
     sources = state["sources"]
 
     refs_lines = []
@@ -740,8 +1007,37 @@ def finalize_node(state: AgentState) -> AgentState:
             refs_lines.append(f"[{n}] {s.title} — {s.url}")
 
     refs = "\n".join(refs_lines) if refs_lines else "(no sources were cited)"
-    final = f"{state['draft_answer']}\n\n---\nReferences:\n{refs}"
-    return {**state, "final_answer": final}
+
+    # Evaluate answer quality with RAGAS, using only the snippets of
+    # sources actually cited in the (now stripped) draft — scoring
+    # against uncited evidence would understate faithfulness.
+    print("  Scoring answer quality with RAGAS...")
+    cited_contexts = []
+    seen_snippet_keys = set()
+    for n in cited_numbers:
+        idx = n - 1
+        if 0 <= idx < len(sources):
+            s = sources[idx]
+            key = _dedup_key(s)
+            if key in seen_snippet_keys:
+                continue
+            seen_snippet_keys.add(key)
+            if s.snippet:
+                cited_contexts.append(s.snippet)
+
+    eval_scores = evaluate_answer(state["query"], draft, cited_contexts)
+
+    eval_block = ""
+    if eval_scores:
+        label_map = {"faithfulness": "Faithfulness", "answer_relevancy": "Answer Relevancy"}
+        lines = [f"- {label_map.get(k, k)}: {v}" for k, v in eval_scores.items()]
+        eval_block = "\n\n---\nQuality Metrics (RAGAS):\n" + "\n".join(lines)
+        print(f"  Scores: {eval_scores}")
+    else:
+        print("  Scores unavailable (no cited context, or evaluation failed).")
+
+    final = f"{draft}\n\n---\nReferences:\n{refs}{eval_block}"
+    return {**state, "draft_answer": draft, "final_answer": final, "eval_scores": eval_scores}
 
 
 # ---------------------------------------------------------------------------
