@@ -35,12 +35,22 @@ The main proper-noun/topic of the original question (e.g. "LangChain")
 is extracted once up front and re-injected into every query generated
 during planning *and* during the verification retry loop, so later
 iterations can't drift onto a different topic.
+
+RAG (Chroma)
+------------
+Alongside live web/arXiv search, retrieve_node also queries a local
+Chroma vector store (vector_store.py) for semantically similar content
+gathered from *previous* runs. analyze_node writes newly gathered
+sources back into Chroma after synthesizing an answer, so the knowledge
+base grows over time and future queries can hit cached, relevant
+evidence instantly instead of only relying on live search.
 """
 
 import os
 import json
 import re
 import time
+from vector_store import query_chroma, add_to_chroma
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import TypedDict, List, Dict, Optional
 
@@ -495,6 +505,12 @@ def retrieve_node(state: AgentState) -> AgentState:
     # search — DDG's coverage of arXiv depends on what it happens to have
     # indexed, while the Arxiv API is authoritative and typically returns
     # more/better matches for a given topic.
+    #
+    # Chroma is queried alongside web/arxiv (not only as a fallback) so
+    # semantically relevant results from prior runs are available to
+    # analyze_node in the very same pass — this is the RAG "long-term
+    # memory" layer. It is skipped in paper_mode since that flow is
+    # restricted to live academic-domain search only.
     tasks = []  # list of (label, kind, query_string, max_results)
     if state["paper_mode"]:
         per_domain_results = 4 if mode == "broad" else 2
@@ -509,6 +525,7 @@ def retrieve_node(state: AgentState) -> AgentState:
     else:
         for q in state["pending_queries"]:
             tasks.append((q, "web", q, 4))
+            tasks.append((f"chroma: {q}", "chroma", q, 5))
 
     print(f"\n[RETRIEVE] Running {len(tasks)} search(es) in parallel...")
 
@@ -516,6 +533,8 @@ def retrieve_node(state: AgentState) -> AgentState:
         try:
             if kind == "arxiv":
                 return label, search_arxiv_structured(query_string, max_results=max_results), None
+            if kind == "chroma":
+                return label, query_chroma(query_string, n_results=max_results), None
             return label, web_search(query_string, max_results=max_results), None
         except Exception as e:
             return label, [], e
@@ -626,6 +645,16 @@ references list):"""
 
     response = _invoke_with_retry(llm, prompt, fallback=fallback_llm)
     print("  Draft answer generated.")
+
+    # Persist this run's gathered sources into the Chroma vector store so
+    # future queries can hit them via semantic search instead of only
+    # relying on live web/arxiv calls. Wrapped defensively so a storage
+    # hiccup never breaks the answer pipeline itself.
+    try:
+        add_to_chroma(state["sources"])
+    except Exception as e:
+        print(f"  [chroma] warning: failed to store sources for future reuse: {e}")
+
     return {**state, "draft_answer": response.content}
 
 

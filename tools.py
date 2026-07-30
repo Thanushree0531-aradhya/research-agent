@@ -7,6 +7,11 @@ Includes:
                     that class has moved between langchain / langchain_community
                     across versions and kept breaking imports; calling the
                     underlying `arxiv` library directly avoids that churn).
+
+Note: newer versions of the `arxiv` package moved result iteration off of
+`Search.results()` (removed) and onto `Client.results(search)` instead.
+Both functions below use the `Client`-based API so they keep working on
+current `arxiv` package versions.
 """
 from dataclasses import dataclass
 from typing import List
@@ -16,8 +21,10 @@ from ddgs import DDGS
 try:
     import arxiv
     _ARXIV_AVAILABLE = True
+    _ARXIV_CLIENT = arxiv.Client()
 except ImportError:
     _ARXIV_AVAILABLE = False
+    _ARXIV_CLIENT = None
 
 
 # -------------------------------
@@ -72,7 +79,7 @@ def search_arxiv(query: str, max_results: int = 5) -> str:
             sort_by=arxiv.SortCriterion.Relevance,
         )
         entries = []
-        for result in search.results():
+        for result in _ARXIV_CLIENT.results(search):
             authors = ", ".join(a.name for a in result.authors) or "Unknown authors"
             summary = (result.summary or "").strip().replace("\n", " ")
             if len(summary) > 400:
@@ -106,7 +113,7 @@ def search_arxiv_structured(query: str, max_results: int = 5) -> List[SearchResu
             max_results=max_results,
             sort_by=arxiv.SortCriterion.Relevance,
         )
-        for result in search.results():
+        for result in _ARXIV_CLIENT.results(search):
             summary = (result.summary or "").strip().replace("\n", " ")
             if len(summary) > 300:
                 summary = summary[:300].rstrip() + "..."
