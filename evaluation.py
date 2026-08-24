@@ -14,10 +14,31 @@ Both metrics work without a ground-truth/reference answer, which matters
 here since this agent answers arbitrary user questions with no pre-written
 "correct" answer to compare against.
 
-Uses the same Groq LLM and the same HuggingFace embedding model already
-used elsewhere in this project (vector_store.py), wrapped for RAGAS via
-its Langchain adapters, so no second embedding model needs to be
-downloaded.
+Embedding model
+----------------
+AnswerRelevancy scores an answer by generating several synthetic
+"reverse" questions FROM the answer, then comparing their embeddings to
+the embedding of the ORIGINAL question -- contexts are not used at all in
+this particular metric, only question-vs-reverse-question similarity.
+That makes the embedding model the single biggest lever on this score,
+independent of anything the agent's own prompts do.
+
+"all-MiniLM-L6-v2" is a solid general-purpose sentence-similarity model,
+but it's tuned for broad semantic-textual-similarity (e.g. clustering
+similar sentences), not specifically for question-to-question matching.
+In practice this tends to compress genuinely well-matched questions into
+a narrow, unremarkable cosine-similarity band (~0.5-0.65) rather than
+spreading them toward 1.0 the way a query-matching-tuned model does --
+which shows up as an answer_relevancy score that stays stubbornly
+mediocre even when the answer itself is good and directly on-topic.
+
+"multi-qa-MiniLM-L6-cos-v1" is the same size/class of model but was
+trained specifically on question/answer and question/question pairs for
+semantic search -- i.e. exactly the kind of comparison AnswerRelevancy
+is doing -- so it should produce scores that better reflect actual
+relevance instead of being capped by a mismatched training objective.
+Same download size class as before, so this doesn't meaningfully change
+setup cost.
 
 Rate limiting
 -------------
@@ -57,7 +78,21 @@ from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 
 EVAL_MODEL_NAME = os.environ.get("RESEARCH_AGENT_EVAL_MODEL", "llama-3.3-70b-versatile")
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+# Tuned for question/question and question/answer semantic search, unlike
+# the general-purpose all-MiniLM-L6-v2 previously used here -- see the
+# "Embedding model" note above for why this specifically targets the
+# answer_relevancy score being structurally low. mpnet-base is a larger,
+# more capable model than the MiniLM variant tried first -- slower per
+# call and a bigger one-time download (~420MB vs ~90MB), traded for
+# somewhat better semantic precision on question-matching. The "-cos-"
+# variant (not "-dot-") is used deliberately: RAGAS's AnswerRelevancy
+# computes cosine similarity between embeddings, and the dot-product
+# variant is calibrated/trained for raw dot-product ranking rather than
+# cosine, so it isn't the right pairing for how this score is actually
+# computed.
+EMBEDDING_MODEL_NAME = os.environ.get(
+    "RESEARCH_AGENT_EVAL_EMBEDDING_MODEL", "multi-qa-mpnet-base-cos-v1"
+)
 
 # RAGAS's answer_relevancy metric defaults to strictness=3, which makes it
 # request n=3 completions per call for self-consistency scoring. Groq's

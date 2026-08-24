@@ -54,6 +54,12 @@ gives a support_ratio (fraction of claims that hold up) instead of a
 single true/false, and finalize_node uses it to strip any claim that
 didn't hold up before the answer is scored by RAGAS.
 
+verify_node only shows the verifier LLM the sources actually cited in
+the draft (falling back to a reranked top-N when the draft has no
+citations at all), rather than the full retrieved pool — otherwise a
+large source pool (20-60+ sources) blows past small models' per-minute
+token limits on Groq and causes 413 "Request too large" errors.
+
 JSON robustness (verify + plan)
 --------------------------------
 Both plan_node and verify_node ask the LLM to return JSON. Three layers
@@ -72,6 +78,7 @@ import os
 import json
 import re
 import time
+from collections import Counter
 from vector_store import query_chroma, add_to_chroma
 from evaluation import evaluate_answer
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
@@ -268,6 +275,14 @@ _STOPWORDS = {
     "study", "studies", "please", "can", "you", "me", "in", "a", "an",
     "compare", "summarize", "describe", "discuss", "list", "show",
     "analyze", "outline", "define", "write", "find",
+    # Generic qualifiers that add no topic information on their own, but
+    # would otherwise get swept up into the "longest capitalized run"
+    # heuristic below (especially for ALL-CAPS questions, where every
+    # word looks "capitalized"). e.g. "DESCRIBE MCP IN DETAIL" should
+    # lock onto "MCP", not "MCP IN DETAIL".
+    "detail", "details", "depth", "brief", "briefly", "overview",
+    "of", "on", "to", "and", "or", "for", "is", "are", "does", "do",
+    "it", "its", "into", "at", "as",
 }
 
 
@@ -399,6 +414,79 @@ def _dedup_key(source: SearchResult) -> str:
     return _normalize_title(getattr(source, "title", "")) or (getattr(source, "url", "") or "")
 
 
+def _looks_like_acronym(term: str) -> bool:
+    """True for short, all-caps single words like 'MCP', 'API', 'RAG' —
+    the kind of term that's prone to colliding with an unrelated expansion
+    elsewhere on the web (e.g. 'MCP' = Model Context Protocol vs. 'Model
+    Control Protocols')."""
+    return bool(term) and 2 <= len(term) <= 6 and term.isalpha() and term.isupper()
+
+
+def _extract_expansion(text: str, acronym: str) -> Optional[str]:
+    """
+    Looks for a spelled-out expansion of `acronym` in `text` — e.g. for
+    acronym="MCP", matches phrases like "Model Context Protocol" (allowing
+    up to 2 lowercase filler words between the initials, e.g. "Ministry
+    of Community Planning"). Returns the normalized matched phrase, or
+    None if no such expansion is present in this text.
+    """
+    if not text:
+        return None
+    segments = []
+    for i, ch in enumerate(acronym):
+        word_pattern = rf"{ch}[a-zA-Z]*"
+        if i == 0:
+            segments.append(word_pattern)
+        else:
+            segments.append(rf"(?:[a-z]+\s+){{0,2}}{word_pattern}")
+    pattern = r"\b" + r"\s+".join(segments) + r"\b"
+    m = re.search(pattern, text)
+    if not m:
+        return None
+    return re.sub(r"\s+", " ", m.group(0)).strip().lower()
+
+
+def _filter_acronym_collisions(sources: List[SearchResult], acronym: Optional[str]):
+    """
+    Guards against a short acronym (e.g. "MCP") legitimately expanding to
+    two different, unrelated things across the web (e.g. "Model Context
+    Protocol" vs. "Model Control Protocols"). Retrieval/dedup has no way
+    to notice this on its own since both results genuinely mention "MCP"
+    — but citing the wrong expansion's source can quietly wreck
+    faithfulness (the source doesn't actually support claims about the
+    *other* meaning) even though claim-level verification passes, since
+    the verifier is just checking claim-vs-snippet agreement, not
+    checking that the snippet is about the right underlying concept.
+
+    Detects each source's expansion (if any is stated nearby in its
+    title/snippet), finds the dominant one across the pool, and drops
+    sources tied to a different, minority expansion. Sources with no
+    detected expansion at all are kept (benefit of the doubt — most
+    sources reference the acronym without ever spelling it out).
+    """
+    if not _looks_like_acronym(acronym or ""):
+        return sources, 0
+
+    expansions = []
+    for s in sources:
+        text = f"{getattr(s, 'title', '') or ''} {getattr(s, 'snippet', '') or ''}"
+        expansions.append(_extract_expansion(text, acronym))
+
+    counts = Counter(e for e in expansions if e)
+    if len(counts) <= 1:
+        return sources, 0  # no collision detected — nothing to filter
+
+    dominant, _ = counts.most_common(1)[0]
+    kept = []
+    dropped = 0
+    for s, e in zip(sources, expansions):
+        if e is None or e == dominant:
+            kept.append(s)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
 # Title/URL signals that a result is NOT an actual paper, even though it
 # was returned by a `site:` search against an academic domain (blog posts,
 # guides, and listing pages get indexed there too).
@@ -449,6 +537,27 @@ def extract_topic_entity(question: str) -> Optional[str]:
     quoted = re.search(r"\"([^\"]{2,250})\"|'([^']{2,250})'", question)
     if quoted:
         return (quoted.group(1) or quoted.group(2)).strip()
+
+    # If the question is ALL CAPS (or close to it), capitalization carries
+    # no signal about proper nouns — every word "looks" capitalized, so
+    # the CamelCase-run heuristic below would grab the entire sentence
+    # (e.g. "DESCRIBE MCP IN DETAIL" -> "MCP IN DETAIL" instead of just
+    # "MCP"), and that whole phrase then gets forced into every search
+    # query, diluting retrieval. Detect this case and fall back to
+    # picking the single strongest remaining token after stopword removal
+    # instead of a capitalized-run match.
+    letters_only = re.sub(r"[^A-Za-z]", "", question)
+    is_shouted = len(letters_only) > 3 and letters_only == letters_only.upper()
+    if is_shouted:
+        tokens = re.findall(r"[A-Za-z][A-Za-z0-9]*", question)
+        remaining = [t for t in tokens if t.lower() not in _STOPWORDS]
+        if not remaining:
+            return None
+        # Acronyms/product names (MCP, API, AWS) are typically shorter
+        # than descriptive words (architecture, specifications) in a
+        # question like this, so shortest-remaining-token is a reasonable
+        # proxy for "the actual topic" when case gives no other signal.
+        return min(remaining, key=len)
 
     # Otherwise take the longest run of capitalized / CamelCase tokens
     # that isn't just a sentence-starting stopword.
@@ -572,7 +681,17 @@ def plan_node(state: AgentState) -> AgentState:
             f"\"{state['topic_entity']}\". Every single query you write MUST "
             f"contain the exact term \"{state['topic_entity']}\" verbatim "
             f"(same spelling/casing). Do not rename it, paraphrase it, or "
-            f"substitute a related/competing term."
+            f"substitute a related/competing term.\n"
+            f"If \"{state['topic_entity']}\" could plausibly refer to more "
+            f"than one thing (e.g. it's a short acronym reused across "
+            f"different industries — firmware, networking, chemistry,"
+            f"etc.), pick the single interpretation that best fits the "
+            f"overall phrasing of the question below, and use ONLY that "
+            f"one interpretation in every query. Do NOT hedge your bets by "
+            f"writing some queries for one meaning and other queries for a "
+            f"different, unrelated meaning — that splits the search effort "
+            f"across two different topics and produces a shallow, mixed "
+            f"result set instead of a thorough one."
         )
 
     mode = state["paper_query_mode"]
@@ -750,6 +869,13 @@ def retrieve_node(state: AgentState) -> AgentState:
 
     if pool_cap_hit:
         print(f"  Pool cap ({pool_cap}) reached — extra results discarded.")
+
+    if state["topic_entity"]:
+        sources, n_dropped = _filter_acronym_collisions(sources, state["topic_entity"])
+        if n_dropped:
+            print(f"  [acronym filter] Dropped {n_dropped} source(s) using a different "
+                  f"expansion of \"{state['topic_entity']}\" than the dominant one in this pool.")
+
     print(f"  Total unique sources so far: {len(sources)}")
     return {**state, "sources": sources, "pending_queries": []}
 
@@ -799,6 +925,23 @@ fewer than {n}."""
     prompt = f"""You are a research assistant. Using ONLY the evidence below,
 write a clear, structured answer to the question. Cite sources inline
 using their bracket numbers, e.g. [1], [2].
+
+Start with one sentence that directly restates and answers the core of
+the question, using the same key terms the question uses. Then expand
+with supporting detail.
+
+Answer the question as directly and specifically as possible. If a
+source contains information that is only tangentially related to the
+question (e.g. unrelated case studies, or background on a different but
+similar topic), leave it out even if it's interesting — every sentence
+should clearly serve the question being asked, not just be "about" the
+same general subject.
+
+EXCLUDE vendor/consulting marketing content even when it's technically
+about the topic — e.g. a company's list of paid services, integrations
+they sell, or client offerings ("our services include...", "we provide
+custom development of..."). This describes a business, not the
+technology itself, and should never be cited even if a source states it.
 
 If the evidence doesn't fully support a claim, don't state it as fact.
 
@@ -852,7 +995,31 @@ def verify_node(state: AgentState) -> AgentState:
     valid JSON, and was the main cause of cascading Groq 429s.
     """
     print("\n[VERIFY] Checking draft against evidence (claim-level)...")
-    sources_block = _format_sources_block(state["sources"])
+
+    # --- Cap what's shown to the verifier -------------------------------
+    # Only the sources actually cited [n] in the draft need to be checked
+    # against — that's all the claim-level check can ever reference.
+    # Previously this passed the FULL retrieved pool (title + URL + full
+    # snippet for every source, sometimes 50-60+) to verification_llm,
+    # which runs on a small 6,000-TPM Groq model. That's what caused the
+    # 413 "Request too large" errors once the pool grew past ~20-30
+    # sources. Restricting to cited sources (with a reranked fallback if
+    # the draft somehow has no citations) keeps this well within limits.
+    cited_in_draft = sorted({int(n) - 1 for n in re.findall(r"\[(\d+)\]", state["draft_answer"])})
+    cited_in_draft = [i for i in cited_in_draft if 0 <= i < len(state["sources"])]
+
+    if cited_in_draft:
+        verify_indices = cited_in_draft
+    elif len(state["sources"]) > MAX_SYNTHESIS_SOURCES:
+        verify_indices = _top_synthesis_indices(state["sources"], MAX_SYNTHESIS_SOURCES, query=state["query"])
+    else:
+        verify_indices = None  # small pool, show everything
+
+    if verify_indices is not None:
+        print(f"  Capping verify context: {len(state['sources'])} retrieved -> "
+              f"{len(verify_indices)} shown to verifier.")
+
+    sources_block = _format_sources_block(state["sources"], include_indices=verify_indices)
 
     topic_lock_instruction = ""
     if state["topic_entity"]:
@@ -975,16 +1142,44 @@ def finalize_node(state: AgentState) -> AgentState:
 answer. Do not rewrite, rephrase, or reorder anything else. Keep all
 other sentences and their [n] citations exactly as-is.
 
+CRITICAL: Just delete the listed claims/sentences. Do NOT add any words
+about the fact that you removed something — no "has been removed", no
+"this sentence now reads", no bracketed notes, no editorial commentary
+of any kind. The reader must never see any trace that an edit happened.
+
+Example of what NOT to do:
+  BAD:  "...is seen as a novel approach has been removed, this sentence
+         now reads: It has been compared to..."
+  GOOD: "...It has been compared to..."
+
 Claims to remove:
 {chr(10).join('- ' + c.get('claim', '') for c in state['unsupported_claims'])}
 
 Original answer:
 {draft}
 
-Return only the edited answer, no preamble."""
+Return only the edited answer, no preamble, no commentary about the edit."""
+
+        # Telltale phrases indicating the model narrated the edit inline
+        # instead of cleanly deleting text — these have shown up leaking
+        # straight into user-facing output, so treat any occurrence as a
+        # failed edit rather than trying to regex it back out afterward.
+        _META_EDIT_SIGNALS = (
+            "has been removed", "now reads", "this sentence now",
+            "was removed", "has been deleted", "edited to remove",
+            "no longer includes",
+        )
+
         try:
             response = _invoke_with_retry(llm, strip_prompt, fallback=fallback_llm)
-            draft = response.content
+            candidate = response.content
+            lowered = candidate.lower()
+            if any(sig in lowered for sig in _META_EDIT_SIGNALS):
+                print("  [strip] warning: model narrated the edit instead of cleanly "
+                      "removing text — discarding the stripped version and keeping "
+                      "the original draft (with unsupported claims still present).")
+            else:
+                draft = candidate
         except Exception as e:
             print(f"  [strip] warning: failed to strip unsupported claims, using original draft: {e}")
 
